@@ -3,6 +3,39 @@ import requests
 import pandas as pd
 import time
 
+import streamlit as st
+
+def top_nav():
+    st.markdown("""
+    <style>
+        .nav-container {
+            background-color: #161A1D;
+            padding: 10px;
+            border-bottom: 1px solid #30363D;
+            position: sticky;
+            top: 0;
+            z-index: 999;
+        }
+        .nav-item {
+            color: white;
+            margin-right: 20px;
+            font-size: 18px;
+            font-weight: 600;
+            text-decoration: none;
+        }
+        .nav-item:hover { color: #00E3FF; }
+    </style>
+
+    <div class="nav-container">
+        <a class="nav-item" href="/?page=home">Home</a>
+        <a class="nav-item" href="/?page=option-chain">Option Chain</a>
+        <a class="nav-item" href="/?page=oi-monitor">OI Monitor</a>
+        <a class="nav-item" href="https://github.com/premrout/niftytrader-clone">GitHub</a>
+    </div>
+    """, unsafe_allow_html=True)
+
+top_nav()
+
 # ---------- CONFIG ----------
 REFRESH_SECONDS = 15
 
