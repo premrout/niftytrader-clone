@@ -200,4 +200,4 @@ while True:
         st.dataframe(df10, use_container_width=True)
 
     time.sleep(REFRESH_SECONDS)
-    st.experimental_rerun()
+    st.()
