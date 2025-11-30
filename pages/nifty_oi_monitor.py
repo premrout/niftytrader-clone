@@ -199,5 +199,5 @@ while True:
 
         st.dataframe(df10, use_container_width=True)
 
-    time.sleep(REFRESH_SECONDS)
-    st.()
+time.sleep(refresh_interval)
+st.rerun()
