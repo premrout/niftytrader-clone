@@ -7,3 +7,7 @@ beautifulsoup4
 lxml
 playwright
 yfinance
+matplotlib
+pytz
+streamlit-autorefresh
+openchart
