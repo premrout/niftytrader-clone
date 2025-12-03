@@ -1,282 +1,203 @@
 # app.py
 """
-Streamlit app: NIFTY last 30 trading days intraday charts (open -> 11:30)
-- Attempts to fetch minute OHLCV for each trading day
-- Shows 30 mini-charts on a single page
-- Auto-refresh scheduled for next 09:00 IST and 17:00 IST using st_autorefresh
-- Provides volume analysis and suggested entry/exit windows
+Streamlit app: NIFTY last N trading days intraday charts (09:15 -> 11:30 IST).
+This is a simplified, parse-safe version intended to avoid SyntaxError issues.
+It attempts to fetch data using yfinance as a fallback. If you prefer a
+different data provider, integrate it in fetch_intraday_for_date().
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from datetime import datetime, time, timedelta
+from datetime import datetime, date, time, timedelta
 import pytz
 import math
-import io
-import requests
-import sys
 import traceback
 
-# --- Optional: if you want to use an NSE-focused library (preferred if available).
-# We'll attempt to use openchart (if installed) otherwise fallback to yfinance.
-try:
-    import openchart  # optional library; if available use it (github: marketcalls/openchart)
-    HAS_OPENCHART = True
-except Exception:
-    HAS_OPENCHART = False
-
-# fallback
+# Optional imports: guard them so missing optional packages do not raise SyntaxError
+HAS_YFINANCE = False
 try:
     import yfinance as yf
     HAS_YFINANCE = True
 except Exception:
     HAS_YFINANCE = False
 
-st.set_page_config(page_title="NIFTY — 30-day intraday (to 11:30)", layout="wide")
+# Optional autorefresh helper (streamlit-autorefresh). If missing, app still runs.
+HAS_AUTORE = False
+try:
+    from streamlit_autorefresh import st_autorefresh
+    HAS_AUTORE = True
+except Exception:
+    HAS_AUTORE = False
 
-# -------------------------
-# Utility: IST timezone helpers
-# -------------------------
+st.set_page_config(page_title="NIFTY — intraday 09:15→11:30", layout="wide")
 IST = pytz.timezone("Asia/Kolkata")
 
 def now_ist():
     return datetime.now(IST)
 
-def seconds_until_next_target(hour_targets=(9,17)):
-    """Return seconds until next target time (in IST). Targets are hour values (24h)."""
+def seconds_until_next_target(hours=(9, 17)):
     now = now_ist()
     today = now.date()
-    # candidate datetimes:
     candidates = []
-    for h in hour_targets:
-        target_dt = IST.localize(datetime.combine(today, time(h,0,0)))
-        if target_dt <= now:
-            target_dt = target_dt + timedelta(days=1)
-        candidates.append(target_dt)
+    for h in hours:
+        try:
+            dt = IST.localize(datetime.combine(today, time(h, 0, 0)))
+        except Exception:
+            dt = IST.localize(datetime.combine(today, time(h, 0, 0)))
+        if dt <= now:
+            dt = dt + timedelta(days=1)
+        candidates.append(dt)
     next_target = min(candidates)
-    delta = next_target - now
-    return int(delta.total_seconds())
+    return int((next_target - now).total_seconds())
 
-# -------------------------
-# Data fetchers
-# -------------------------
-# User-specified params
-SYMBOL_FOR_YFINANCE = "^NSEI"  # Yahoo ticker for Nifty 50 index (used when falling back)
-
-@st.cache_data(ttl=60*60)  # cache for 1 hour
-def fetch_intraday_for_date(date_obj):
-    """
-    Fetch minute-level intraday OHLCV for NIFTY for a single date.
-    - Tries openchart (if available) to get 1m data from NSE
-    - Otherwise tries yfinance (may return 1m only for recent days)
-    Returns DataFrame with index as timestamp (localized to IST) and columns: ['Open','High','Low','Close','Volume']
-    """
-    date_str = date_obj.strftime("%Y-%m-%d")
-    # 1) Try openchart if available
-    if HAS_OPENCHART:
-        try:
-            # the library's API: openchart.history(symbol, timeframe='1m', start=..., end=...) -- adjust if library differs
-            # We'll try to be defensive.
-            df = openchart.history('NIFTY 50', timeframe='1m', start=date_str, end=date_str)
-            if df is not None and not df.empty:
-                # ensure index tz -> IST
-                if df.index.tzinfo is None:
-                    df.index = df.index.tz_localize('UTC').tz_convert('Asia/Kolkata')
-                else:
-                    df.index = df.index.tz_convert('Asia/Kolkata')
-                return df[['Open','High','Low','Close','Volume']]
-        except Exception:
-            # fall through to next method
-            st.write("OpenChart fetch failed for", date_str)
-            st.write(traceback.format_exc())
-
-    # 2) Try yfinance fallback
-    if HAS_YFINANCE:
-        try:
-            # yfinance fetch; 1m interval usually available for up to last 7 days only on free endpoints.
-            start = date_obj.strftime("%Y-%m-%d")
-            end = (date_obj + timedelta(days=1)).strftime("%Y-%m-%d")
-            ticker = yf.Ticker(SYMBOL_FOR_YFINANCE)
-            # yfinance: history(interval='1m', start=..., end=...)
-            df = ticker.history(interval="1m", start=start, end=end, auto_adjust=False, prepost=False)
-            if df is not None and not df.empty:
-                # Yahoo returns index in UTC or local - convert to IST
-                if df.index.tzinfo is None:
-                    df.index = df.index.tz_localize('UTC').tz_convert('Asia/Kolkata')
-                else:
-                    df.index = df.index.tz_convert('Asia/Kolkata')
-                # Ensure required columns
-                df = df.rename(columns={"Open":"Open","High":"High","Low":"Low","Close":"Close","Volume":"Volume"})
-                return df[['Open','High','Low','Close','Volume']]
-        except Exception:
-            st.write("yfinance fetch failed for", date_str)
-            st.write(traceback.format_exc())
-
-    # 3) As last resort, return empty
-    return pd.DataFrame(columns=['Open','High','Low','Close','Volume'])
-
-@st.cache_data(ttl=60*60*24)
-def get_last_n_trading_days(n=30):
-    """
-    Return a list of last n trading dates (business days excluding weekends). This is a simple approximation:
-    we will pick last n weekdays; if you need exchange holidays removed, integrate exchange calendar.
-    """
+@st.cache_data(ttl=60*60)
+def get_last_n_weekdays(n=30):
     days = []
     cur = now_ist().date()
     while len(days) < n:
-        if cur.weekday() < 5:  # Mon-Fri
+        if cur.weekday() < 5:
             days.append(cur)
         cur = cur - timedelta(days=1)
     days = sorted(days)
     return days
 
-# -------------------------
-# Analysis functions
-# -------------------------
-def clip_to_session(df):
-    """Keep rows from market open (09:15) to 11:30 inclusive (IST)"""
+@st.cache_data(ttl=60*60)
+def fetch_intraday_for_date(date_obj):
+    """
+    Return minute-level DataFrame for the given date (if available).
+    Columns: ['Open','High','Low','Close','Volume'], index tz-aware in IST.
+    This uses yfinance fallback; it may not return 1m for older dates.
+    """
+    empty = pd.DataFrame(columns=['Open','High','Low','Close','Volume'])
+    if not HAS_YFINANCE:
+        return empty
+    try:
+        start = date_obj.strftime("%Y-%m-%d")
+        end = (date_obj + timedelta(days=1)).strftime("%Y-%m-%d")
+        ticker = yf.Ticker("^NSEI")  # Yahoo ticker for NIFTY index
+        df = ticker.history(interval="1m", start=start, end=end, auto_adjust=False, prepost=False)
+        if df is None or df.empty:
+            return empty
+        # Ensure tz: yfinance usually returns tz-aware UTC or naive; convert to IST
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC").tz_convert("Asia/Kolkata")
+        else:
+            df.index = df.index.tz_convert("Asia/Kolkata")
+        # Keep only required columns and ensure names are consistent
+        df = df.rename(columns={"Open":"Open","High":"High","Low":"Low","Close":"Close","Volume":"Volume"})
+        df = df[['Open','High','Low','Close','Volume']]
+        return df
+    except Exception:
+        # Return empty if any error while fetching so the app remains parse-safe
+        return empty
+
+def clip_session(df):
     if df.empty:
         return df
-    # ensure index tz-aware in IST
-    idx = df.index.tz_convert('Asia/Kolkata')
+    try:
+        idx = df.index.tz_convert("Asia/Kolkata")
+    except Exception:
+        idx = df.index
     mask = (idx.time >= time(9,15)) & (idx.time <= time(11,30))
     return df.loc[mask]
 
-def aggregate_per_minute(df):
-    """Return per-minute OHLCV (if input is higher granularity). Here we assume df is already 1m"""
-    return df.resample('1T').agg({'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'}).dropna()
-
-def compute_volume_profile(all_day_frames):
-    """
-    all_day_frames: list of DataFrames (each with minute index localized to IST in same date) clipped to 09:15-11:30
-    Returns avg_volume_by_minute: Series indexed by minute-of-day string 'HH:MM' -> average volume
-    """
-    frames = []
-    for df in all_day_frames:
-        if df.empty: continue
-        df2 = df.copy()
-        # minute key
-        df2['minute_key'] = df2.index.strftime('%H:%M')
-        frames.append(df2[['minute_key','Volume']])
-    if not frames:
+def compute_avg_volume(frames):
+    frames_clean = []
+    for f in frames:
+        if f is None or f.empty:
+            continue
+        tmp = f.copy()
+        tmp['minute_key'] = tmp.index.strftime("%H:%M")
+        frames_clean.append(tmp[['minute_key','Volume']])
+    if not frames_clean:
         return pd.Series(dtype=float)
-    big = pd.concat(frames)
+    big = pd.concat(frames_clean, ignore_index=True)
     avg = big.groupby('minute_key')['Volume'].mean().sort_index()
     return avg
 
-def detect_entry_exit(avg_volume_series, top_percentile=90, taper_threshold_pct=0.4):
-    """
-    Suggest entry and exit times:
-    - entry: minutes where average volume is above top_percentile percentile (e.g., 90th)
-    - exit: heuristic: minutes after the main peak where volume drops below taper_threshold_pct * peak_volume
-    Returns dict: {'peak_minutes':[...], 'suggested_entry': first_peak_minute, 'suggested_exit': minute_when_volume_drops}
-    """
-    if avg_volume_series.empty:
-        return {}
-    peak_vol = avg_volume_series.max()
-    threshold = np.percentile(avg_volume_series.values, top_percentile)
-    peak_minutes = avg_volume_series[avg_volume_series >= threshold].index.tolist()
-    # take earliest peak minute as entry
-    suggested_entry = peak_minutes[0] if peak_minutes else avg_volume_series.idxmax()
-    # find exit: after the peak, find first minute where volume <= taper_threshold_pct * peak_vol
+def detect_entry_exit(avg_vol_series):
+    result = {}
+    if avg_vol_series.empty:
+        return result
+    arr = avg_vol_series.values
     try:
-        idx_peak = list(avg_volume_series.index).index(suggested_entry)
+        threshold = np.percentile(arr, 90)
+    except Exception:
+        threshold = avg_vol_series.max()
+    peaks = avg_vol_series[avg_vol_series >= threshold].index.tolist()
+    suggested_entry = peaks[0] if peaks else avg_vol_series.idxmax()
+    peak_vol = float(avg_vol_series.max())
+    taper_threshold = 0.4 * peak_vol
+    # find exit after entry
+    idxs = list(avg_vol_series.index)
+    try:
+        start_idx = idxs.index(suggested_entry)
     except ValueError:
-        idx_peak = avg_volume_series.idxmax()
-        idx_peak = list(avg_volume_series.index).index(idx_peak)
+        start_idx = idxs.index(avg_vol_series.idxmax())
     exit_minute = None
-    for i in range(idx_peak+1, len(avg_volume_series)):
-        if avg_volume_series.iloc[i] <= taper_threshold_pct * peak_vol:
-            exit_minute = avg_volume_series.index[i]
+    for i in range(start_idx+1, len(idxs)):
+        if avg_vol_series.iloc[i] <= taper_threshold:
+            exit_minute = idxs[i]
             break
     if exit_minute is None:
-        # fallback: last minute in the window
-        exit_minute = avg_volume_series.index[-1]
-    return {
-        "peak_minutes": peak_minutes,
+        exit_minute = idxs[-1]
+    result = {
+        "peak_volume": peak_vol,
+        "threshold_for_peak": float(threshold),
         "suggested_entry": suggested_entry,
         "suggested_exit": exit_minute,
-        "peak_volume": float(peak_vol),
-        "threshold_for_peak": float(threshold)
+        "peak_minutes": peaks
     }
+    return result
 
-# -------------------------
-# UI & Main flow
-# -------------------------
-st.title("NIFTY last 30 days — intraday charts (open → 11:30)")
+# ----------------- UI -----------------
+st.title("NIFTY — last N days intraday (09:15 → 11:30 IST)")
 
-col1, col2 = st.columns([1,3])
-with col1:
-    st.markdown("**Parameters**")
+params_col, notes_col = st.columns([1, 3])
+with params_col:
     n_days = st.number_input("Days to show", min_value=5, max_value=60, value=30, step=5)
-    refresh_note = st.checkbox("Show next auto-refresh time", value=True)
-    re_fetch = st.button("Force re-fetch data now (may take a minute)")
+    show_next = st.checkbox("Show next scheduled refresh", value=True)
+    force_refetch = st.button("Force re-fetch")
+with notes_col:
+    st.markdown("Notes:")
+    st.write("- This is a simplified app. If yfinance is not installed or minute data isn't available for old days, some charts will show `No data`.")
+    st.write("- For production historical minute data use a paid vendor or exchange data feed.")
 
-with col2:
-    st.markdown("**Notes**")
-    st.write("""
-    - The app attempts to fetch minute-level data (1m) for NIFTY from an NSE-focused library (if available).
-    - If that fails, it falls back to Yahoo Finance minute data (may be limited to recent days).
-    - For guaranteed historical minute/tick access consider a paid data vendor or NSE's paid products.
-    """)
-
-# calculate next refresh interval (seconds)
+# compute refresh interval and use st_autorefresh if available
 sec_to_next = seconds_until_next_target((9,17))
-if refresh_note:
-    next_time = now_ist() + timedelta(seconds=sec_to_next)
-    st.write(f"Next scheduled refresh at (IST): **{next_time.strftime('%Y-%m-%d %H:%M:%S')}** — in {sec_to_next} seconds.")
+if show_next:
+    st.write("Next refresh in (approx):", str(timedelta(seconds=sec_to_next)))
+if HAS_AUTORE:
+    sec = max(5, min(sec_to_next, 24*3600))
+    st_autorefresh(interval=sec * 1000, key="auto")
 
-# trigger auto-refresh: st_autorefresh will rerun app after given interval
-# set a max interval of 24 hours; if sec_to_next is 0 small, set to 5 seconds min
-interval_seconds = max(5, min(sec_to_next, 24*3600))
-count = st.experimental_data_editor  # avoid linter warning; not used
-from streamlit_autorefresh import st_autorefresh
-# The streamlit_autorefresh helper: pip install streamlit-autorefresh
-st_autorefresh(interval=interval_seconds * 1000, key="datarefresh")
-
-# main data fetch & plotting
-with st.spinner("Fetching data and preparing charts..."):
-    dates = get_last_n_trading_days(n_days)
+# fetch data
+with st.spinner("Fetching data..."):
+    days = get_last_n_weekdays(n_days)
     day_frames = []
-    failed_days = []
-    for d in dates:
-        try:
-            df = fetch_intraday_for_date(pd.to_datetime(d))
-            df_clip = clip_to_session(df)
-            if df_clip.empty:
-                failed_days.append(d)
-            day_frames.append((d, df_clip))
-        except Exception as e:
-            failed_days.append(d)
-            day_frames.append((d, pd.DataFrame()))
-    # Analysis: compute average volume by minute
-    clipped_frames = [f for (_, f) in day_frames if not f.empty]
-    avg_vol = compute_volume_profile(clipped_frames)
+    for d in days:
+        df = fetch_intraday_for_date(pd.to_datetime(d))
+        clipped = clip_session(df)
+        day_frames.append((d, clipped))
+
+    frames_only = [f for (_, f) in day_frames if not f.empty]
+    avg_vol = compute_avg_volume(frames_only)
     entry_exit = detect_entry_exit(avg_vol)
 
-# show analysis
-st.header("Volume analysis (09:15 → 11:30 IST)")
+st.header("Volume analysis (09:15–11:30 IST)")
 if avg_vol.empty:
-    st.write("No minute-level volume data available. Check data source or try force re-fetch.")
+    st.info("No minute-volume data available. Try installing yfinance or use a data provider.")
 else:
-    # display top 5 high-volume minutes
+    st.metric("Peak avg volume (minute)", f"{int(entry_exit.get('peak_volume', 0))}")
     top5 = avg_vol.sort_values(ascending=False).head(5)
-    st.metric("Peak average volume (minute)", f"{int(entry_exit.get('peak_volume', 0))}")
-    st.write("Top 5 minutes by average volume (HH:MM → avg volume):")
-    st.dataframe(top5.reset_index().rename(columns={'minute_key':'Minute','Volume':'AvgVolume'}).head(10))
+    st.dataframe(top5.reset_index().rename(columns={'minute_key':'Minute','Volume':'AvgVolume'}))
+    st.markdown(f"**Suggested entry:** `{entry_exit.get('suggested_entry')}`  —  **Suggested exit:** `{entry_exit.get('suggested_exit')}`")
 
-    st.markdown(f"**Suggested entry minute:** `{entry_exit.get('suggested_entry')}`  \n**Suggested exit minute:** `{entry_exit.get('suggested_exit')}`")
-    st.write("Heuristic: entry is earliest minute in top 90th percentile by average volume. Exit is first minute after the peak where volume falls below 40% of the peak.")
-
-# Plot 30 mini-charts on a single page in a grid
-st.header("30 mini-charts (market open → 11:30 IST)")
-
-# number of columns for grid
+st.header("Mini-charts (09:15 → 11:30)")
 cols_per_row = 5
 rows = math.ceil(len(day_frames) / cols_per_row)
-
 for r in range(rows):
     cols = st.columns(cols_per_row)
     for c in range(cols_per_row):
@@ -286,36 +207,25 @@ for r in range(rows):
         d, df = day_frames[idx]
         with cols[c]:
             st.markdown(f"**{d.strftime('%Y-%m-%d')}**")
-            if df.empty:
+            if df is None or df.empty:
                 st.write("No data")
                 continue
-            # simple price + volume chart
-            fig, ax = plt.subplots(2,1, figsize=(3,2.5), gridspec_kw={'height_ratios':[2,1]}, dpi=100)
-            ax0, ax1 = ax
-            # Price line
-            ax0.plot(df.index.time, df['Close'], linewidth=0.8)
-            ax0.set_xticks([df.index.time[0], df.index.time[len(df.index)//2], df.index.time[-1]])
-            ax0.tick_params(axis='x', labelrotation=45)
-            ax0.set_ylabel("Price")
-            ax0.set_title("")
-            # Volume bars
-            ax1.bar(df.index.time, df['Volume'], width=0.0008)
-            ax1.set_xticks([df.index.time[0], df.index.time[len(df.index)//2], df.index.time[-1]])
-            ax1.tick_params(axis='x', labelrotation=45)
-            ax1.set_ylabel("Vol")
+            # plot small chart
+            fig, axes = plt.subplots(2, 1, figsize=(3, 2.4), gridspec_kw={'height_ratios':[2,1]})
+            ax0, ax1 = axes
+            # convert index to times for x axis
+            times = df.index.strftime("%H:%M")
+            ax0.plot(times, df['Close'], linewidth=0.9)
+            ax0.set_xticks([times[0], times[len(times)//2], times[-1]])
+            ax0.tick_params(axis='x', rotation=45, labelsize=7)
+            ax0.set_ylabel("Price", fontsize=8)
+            ax1.bar(times, df['Volume'], width=0.6)
+            ax1.set_xticks([times[0], times[len(times)//2], times[-1]])
+            ax1.tick_params(axis='x', rotation=45, labelsize=7)
+            ax1.set_ylabel("Vol", fontsize=8)
             plt.tight_layout()
             st.pyplot(fig)
             plt.close(fig)
 
 st.write("---")
-st.markdown("**Deployment notes & caveats**")
-st.write("""
-- NSE does not provide unlimited free intraday minute history via public APIs; for reliable, long-range minute/tick history you may need a paid feed or an authorized vendor. (This app attempts open libraries first; fallback to Yahoo may not have old minute data.) :contentReference[oaicite:1]{index=1}
-- If you need guaranteed historical minute data for many past days, consider a data vendor or using a recorded dataset (e.g., Kaggle datasets, or buying historical ticks). :contentReference[oaicite:2]{index=2}
-- The entry/exit detection here is a **heuristic** based purely on average minute volume across days; you should combine it with price movement, VWAP, and risk management rules before trading.
-""")
-
-st.markdown("**How to run on Streamlit Cloud**")
-st.write("""
-1. Create a GitHub repo with this `app.py`.  
-2. Add `requirements.txt` with:  
+st.markdown("If you still see a SyntaxError after replacing the file, check logs for the file/line and paste that line here (I will help fix it).")
