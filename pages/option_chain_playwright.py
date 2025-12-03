@@ -1,199 +1,3 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import requests
-from datetime import datetime
-import time
-import plotly.graph_objects as go
-
-st.set_page_config(page_title="Option Chain (NSE API)", layout="wide")
-
-# ---------------- NSE API DIRECT SCRAPER ----------------
-@st.cache_data(ttl=5)
-def fetch_nse_option_chain(symbol: str):
-    """
-    Fetch option chain from NSE India WITHOUT Playwright.
-    Uses official API endpoint.
-    """
-    url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
-
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "accept": "application/json",
-        "accept-language": "en-US,en;q=0.9",
-    }
-
-    try:
-        session = requests.Session()
-        session.get("https://www.nseindia.com", headers=headers)
-        response = session.get(url, headers=headers, timeout=10)
-        data = response.json()
-    except Exception as e:
-        return None, f"Failed fetching NSE API data: {e}"
-
-    try:
-        rows = data["records"]["data"]
-        oc_list = []
-        for row in rows:
-            strike = row.get("strikePrice")
-
-            ce = row.get("CE", {})
-            pe = row.get("PE", {})
-
-            oc_list.append({
-                "Strike": strike,
-                "CE_LTP": ce.get("lastPrice", 0),
-                "CE_OI": ce.get("openInterest", 0),
-                "PE_LTP": pe.get("lastPrice", 0),
-                "PE_OI": pe.get("openInterest", 0),
-            })
-
-        df = pd.DataFrame(oc_list)
-        df = df.sort_values("Strike").reset_index(drop=True)
-        return df, None
-
-    except Exception as e:
-        return None, f"Parsing error: {e}"
-
-# --------------- Metrics ----------------
-def compute_pcr(df):
-    ce = df["CE_OI"].sum()
-    pe = df["PE_OI"].sum()
-    return round(pe / ce, 2) if ce > 0 else np.nan
-
-
-def compute_max_pain(df):
-    strikes = df["Strike"].unique()
-    pain = []
-
-    for s in strikes:
-        total = 0
-        for _, r in df.iterrows():
-            k = r["Strike"]
-            ce_oi = r["CE_OI"]
-            pe_oi = r["PE_OI"]
-
-            ce_pain = max(s - k, 0) * ce_oi
-            pe_pain = max(k - s, 0) * pe_oi
-            total += ce_pain + pe_pain
-        pain.append((s, total))
-
-    pain_df = pd.DataFrame(pain, columns=["Strike", "Pain"])
-    return int(pain_df.sort_values("Pain").iloc[0]["Strike"])
-
-# --------------- Plots ----------------
-def plot_oi_grouped(df):
-    fig = go.Figure()
-    fig.add_bar(x=df["Strike"], y=df["CE_OI"], name="CE OI")
-    fig.add_bar(x=df["Strike"], y=df["PE_OI"], name="PE OI")
-    fig.update_layout(barmode="group", height=350, template="plotly_dark")
-    return fig
-
-
-def plot_oi_stacked(df):
-    fig = go.Figure()
-    fig.add_bar(x=df["Strike"], y=df["CE_OI"], name="CE OI")
-    fig.add_bar(x=df["Strike"], y=df["PE_OI"], name="PE OI")
-    fig.update_layout(barmode="stack", height=350, template="plotly_dark")
-    return fig
-
-
-def plot_net_heatmap(df):
-    df2 = df.copy()
-    df2["NET"] = df2["PE_OI"] - df2["CE_OI"]
-    fig = go.Figure(
-        data=go.Heatmap(
-            z=[df2["NET"].tolist()],
-            x=df2["Strike"].tolist(),
-            y=["Net OI"],
-            colorscale="RdBu",
-            zmid=0,
-        )
-    )
-    fig.update_layout(height=150, template="plotly_dark")
-    return fig
-
-
-# ---------------- UI ----------------
-st.title("📉 NSE Option Chain — Fast API (No Playwright)")
-
-with st.sidebar:
-    st.header("Controls")
-
-    index_choice = st.selectbox(
-        "Index",
-        ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"],
-        index=0
-    )
-
-    refresh_sec = st.selectbox("Auto Refresh (sec)", [3, 5, 8, 10, 15], index=1)
-    strikes_each = st.slider("Strikes each side of ATM", 3, 15, 6)
-
-    if st.button("Force Refresh"):
-        fetch_nse_option_chain.clear()
-        st.rerun()
-
-df, error = fetch_nse_option_chain(index_choice)
-
-if error:
-    st.error(error)
-    st.stop()
-
-# ATM detection
-df["Sum"] = df["CE_LTP"] + df["PE_LTP"]
-atm = int(df.loc[df["Sum"].idxmin()]["Strike"])
-
-# Filter strikes around ATM
-step = int(df["Strike"].diff().median())
-left = atm - strikes_each * step
-right = atm + strikes_each * step
-fdf = df[(df["Strike"] >= left) & (df["Strike"] <= right)].copy()
-
-# Metrics
-pcr = compute_pcr(fdf)
-max_pain = compute_max_pain(fdf)
-
-c1, c2, c3 = st.columns(3)
-c1.metric("ATM Strike", atm)
-c2.metric("PCR", pcr)
-c3.metric("Max Pain", max_pain)
-
-st.markdown("---")
-
-# Plots
-col1, col2 = st.columns([2, 1])
-
-with col1:
-    st.plotly_chart(plot_oi_grouped(fdf), use_container_width=True)
-    st.plotly_chart(plot_oi_stacked(fdf), use_container_width=True)
-
-with col2:
-    st.plotly_chart(plot_net_heatmap(fdf), use_container_width=True)
-
-# Table
-st.subheader("Option Chain Table")
-st.dataframe(
-    fdf[["Strike", "CE_LTP", "CE_OI", "PE_LTP", "PE_OI"]],
-    use_container_width=True,
-    hide_index=True,
-)
-
-# CSV Download
-st.download_button(
-    "Download CSV",
-    fdf.to_csv(index=False),
-    file_name=f"{index_choice}_option_chain.csv",
-    mime="text/csv",
-)
-
-st.caption(
-    f"Source: NSE India | Last Updated: {datetime.now().strftime('%H:%M:%S')} | Auto-refresh: {refresh_sec}s"
-)
-
-# Auto-refresh
-time.sleep(refresh_sec)
-st.rerun()
-
 # Streamlit Option Chain without Playwright
 # Shows 10 CE & PE around ATM (5 each side)
 # Adds OI change graph
@@ -211,12 +15,21 @@ st.set_page_config(page_title="Option Chain Lite", layout="wide")
 @st.cache_data(ttl=8)
 def fetch_nse_chain(symbol="NIFTY"):
     url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
-    headers = {"User-Agent": "Mozilla/5.0"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.nseindia.com/option-chain",
+        "Connection": "keep-alive",
+    }
     s = requests.Session()
-    r = s.get("https://www.nseindia.com", headers=headers)
+    # First request to get cookies
+    s.get("https://www.nseindia.com", headers=headers)
     r = s.get(url, headers=headers)
-    data = r.json()
-    return data
+    if r.status_code != 200:
+        st.error("NSE blocked request. Refresh or try again.")
+        return {"records": {"data": []}}
+    return r.json()
 
 # ------------------ PARSE CHAIN ------------------
 def parse_chain(data):
@@ -256,7 +69,43 @@ df_f = df[(df['Strike'] >= left) & (df['Strike'] <= right)].copy()
 st.subheader("Nearby Option Strikes (±5)")
 st.dataframe(df_f)
 
-# ------------------ OI CHANGE GRAPH ------------------
+# ------------------ PCR + Trend Calculation ------------------
+# PCR = Sum(PE_OI) / Sum(CE_OI)
+def compute_pcr(df):
+    total_ce = df['CE_OI'].sum()
+    total_pe = df['PE_OI'].sum()
+    return (total_pe / total_ce) if total_ce else 0
+
+pcr = compute_pcr(df_f)
+pcr_change = (df_f['PE_CHG_OI'].sum() - df_f['CE_CHG_OI'].sum()) / max(df_f['CE_OI'].sum(), 1)
+
+st.subheader("PCR & Trend Suggestion")
+st.write(f"PCR (ATM ±5): **{pcr:.2f}**")
+st.write(f"PCR Change Today: **{pcr_change:.3f}**")
+
+if pcr > 1.2 and pcr_change > 0:
+    trend = "Bullish — PE OI rising faster than CE OI"
+elif pcr < 0.8 and pcr_change < 0:
+    trend = "Bearish — CE OI rising faster than PE OI"
+else:
+    trend = "Sideways / Neutral"
+
+st.info(f"Trend: **{trend}**")
+
+# ------------------ PCR Line Graph ------------------
+def plot_pcr_line(df):
+    fig = go.Figure()
+    pe = df['PE_OI']
+    ce = df['CE_OI']
+    pcr_vals = pe / ce.replace(0, np.nan)
+    fig.add_trace(go.Scatter(x=df['Strike'], y=pcr_vals, mode='lines+markers', name='PCR by Strike'))
+    fig.update_layout(title='PCR Across Strikes (ATM ±5)', yaxis_title='PCR')
+    return fig
+
+st.subheader("PCR Line Chart — Strike-wise")
+st.plotly_chart(plot_pcr_line(df_f), use_container_width=True)
+
+# ------------------ OI CHANGE GRAPH ------------------ ------------------
 def plot_oi_change(df):
     fig = go.Figure()
     fig.add_trace(go.Bar(x=df['Strike'], y=df['CE_CHG_OI'], name='CE OI Change'))
@@ -267,3 +116,121 @@ def plot_oi_change(df):
 st.subheader("CE & PE OI Change — Today")
 st.plotly_chart(plot_oi_change(df_f), use_container_width=True)
 
+# ------------------ PCR + Trend Calculation ------------------
+# PCR = Sum(PE_OI) / Sum(CE_OI)
+def compute_pcr(df):
+    total_ce = df['CE_OI'].sum()
+    total_pe = df['PE_OI'].sum()
+    return (total_pe / total_ce) if total_ce else 0
+
+pcr = compute_pcr(df_f)
+pcr_change = (df_f['PE_CHG_OI'].sum() - df_f['CE_CHG_OI'].sum()) / max(df_f['CE_OI'].sum(), 1)
+
+st.subheader("PCR & Trend Suggestion (ATM ±5)")
+st.write(f"PCR: **{pcr:.2f}**")
+st.write(f"PCR Change Today: **{pcr_change:.3f}**")
+
+if pcr > 1.2 and pcr_change > 0:
+    trend = "Bullish — PE OI rising faster than CE OI"
+elif pcr < 0.8 and pcr_change < 0:
+    trend = "Bearish — CE OI rising faster than PE OI"
+else:
+    trend = "Sideways / Neutral"
+
+st.info(f"Market Trend: **{trend}**")
+
+# ------------------ PCR Line Chart ------------------
+def plot_pcr_line(df):
+    fig = go.Figure()
+    pe = df['PE_OI']
+    ce = df['CE_OI'].replace(0, np.nan)
+    pcr_vals = pe / ce
+    fig.add_trace(go.Scatter(x=df['Strike'], y=pcr_vals, mode='lines+markers', name='PCR by Strike'))
+    fig.update_layout(title='PCR Across Strikes (ATM ±5)', yaxis_title='PCR')
+    return fig
+
+st.subheader("Strike-wise PCR Line Chart")
+st.plotly_chart(plot_pcr_line(df_f), use_container_width=True)
+
+# ------------------ PCR (ATM window) ------------------
+pcr_total_ce = df_window['CE_OI'].sum()
+pcr_total_pe = df_window['PE_OI'].sum()
+pcr = (pcr_total_pe / pcr_total_ce) if pcr_total_ce else 0
+
+pcr_change = ((df_window['PE_CHG_OI'].sum()) - (df_window['CE_CHG_OI'].sum())) / max(pcr_total_ce,1)
+
+st.subheader("PCR (ATM ± window) & Trend Suggestion")
+st.markdown(f"**PCR:** {pcr:.2f}")
+st.markdown(f"**PCR Change Today:** {pcr_change:.3f}")
+
+if pcr > 1.2 and pcr_change > 0:
+    pcr_trend = "📈 Bullish — PE OI rising faster than CE OI"
+elif pcr < 0.8 and pcr_change < 0:
+    pcr_trend = "📉 Bearish — CE OI rising faster than PE OI"
+else:
+    pcr_trend = "⚖ Neutral / Sideways"
+
+st.info(f"PCR Trend: **{pcr_trend}**")
+
+# PCR line graph
+pcr_line = df_window['PE_OI'] / df_window['CE_OI'].replace(0, np.nan)
+fig_pcr = go.Figure()
+fig_pcr.add_trace(go.Scatter(x=df_window['Strike'], y=pcr_line, mode='lines+markers', name='PCR by Strike'))
+fig_pcr.update_layout(title='PCR Across Strikes (ATM Window)', template='plotly_dark', height=300, yaxis_title='PCR')
+st.plotly_chart(fig_pcr, use_container_width=True)
+
+# ------------------ RSI (Synthetic) ------------------
+# Create a synthetic underlying price proxy using CE_LTP - PE_LTP across strikes
+prices = df_window['CE_LTP'] - df_window['PE_LTP']
+
+# RSI function
+def compute_rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+rsi_vals = compute_rsi(prices)
+
+st.subheader("RSI (Synthetic Underlying from Option Prices)")
+st.line_chart(rsi_vals)
+
+# RSI trend suggestion
+last_rsi = rsi_vals.iloc[-1]
+if last_rsi >= 70:
+    rsi_trend = "Overbought — Possible Downward Pressure"
+elif last_rsi <= 30:
+    rsi_trend = "Oversold — Possible Upward Pressure"
+else:
+    rsi_trend = "Neutral Momentum"
+
+st.info(f"RSI Trend: **{rsi_trend}**  (RSI = {last_rsi:.2f})")
+
+# ------------------ END RSI Indicator ------------------
+def compute_rsi(series, period=14):
+    delta = series.diff()
+    gain = np.where(delta > 0, delta, 0)
+    loss = np.where(delta < 0, -delta, 0)
+    avg_gain = pd.Series(gain).rolling(period).mean()
+    avg_loss = pd.Series(loss).rolling(period).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+# use CE_LTP as price proxy
+rsi = compute_rsi(df_f['CE_LTP'])
+
+st.subheader("RSI (Using CE LTP as Proxy)")
+st.line_chart(rsi)
+
+if rsi.iloc[-1] > 70:
+    rsi_trend = "Overbought — Possible Downtrend"
+elif rsi.iloc[-1] < 30:
+    rsi_trend = "Oversold — Possible Uptrend"
+else:
+    rsi_trend = "Neutral Momentum"
+
+st.success(f"RSI Momentum: **{rsi_trend}**")
