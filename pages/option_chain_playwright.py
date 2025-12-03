@@ -23,8 +23,7 @@ st.set_page_config(page_title="Option Chain (NSE API)", layout="wide")
 # If you deploy somewhere that blocks meta-refresh, you can use other techniques.
 # ---------- Auto-refresh only the data (15 sec) ----------
 META_REFRESH_SECS = 15
-if hasattr(st, "autorefresh"):
-    st.autorefresh(interval=META_REFRESH_SECS * 1000, key="data_refresh")
+st.markdown(f'<meta http-equiv="refresh" content="{META_REFRESH_SECS}">', unsafe_allow_html=True)
 
 
 # ------------------ Utilities ------------------
