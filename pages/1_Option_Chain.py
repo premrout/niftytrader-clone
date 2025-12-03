@@ -152,6 +152,33 @@ def plot_pcr_line(df):
 st.subheader("Strike-wise PCR Line Chart")
 st.plotly_chart(plot_pcr_line(df_f), use_container_width=True)
 
+# ------------------ PCR (ATM window) ------------------
+pcr_total_ce = df_window['CE_OI'].sum()
+pcr_total_pe = df_window['PE_OI'].sum()
+pcr = (pcr_total_pe / pcr_total_ce) if pcr_total_ce else 0
+
+pcr_change = ((df_window['PE_CHG_OI'].sum()) - (df_window['CE_CHG_OI'].sum())) / max(pcr_total_ce,1)
+
+st.subheader("PCR (ATM ± window) & Trend Suggestion")
+st.markdown(f"**PCR:** {pcr:.2f}")
+st.markdown(f"**PCR Change Today:** {pcr_change:.3f}")
+
+if pcr > 1.2 and pcr_change > 0:
+    pcr_trend = "📈 Bullish — PE OI rising faster than CE OI"
+elif pcr < 0.8 and pcr_change < 0:
+    pcr_trend = "📉 Bearish — CE OI rising faster than PE OI"
+else:
+    pcr_trend = "⚖ Neutral / Sideways"
+
+st.info(f"PCR Trend: **{pcr_trend}**")
+
+# PCR line graph
+pcr_line = df_window['PE_OI'] / df_window['CE_OI'].replace(0, np.nan)
+fig_pcr = go.Figure()
+fig_pcr.add_trace(go.Scatter(x=df_window['Strike'], y=pcr_line, mode='lines+markers', name='PCR by Strike'))
+fig_pcr.update_layout(title='PCR Across Strikes (ATM Window)', template='plotly_dark', height=300, yaxis_title='PCR')
+st.plotly_chart(fig_pcr, use_container_width=True)
+
 # ------------------ RSI Indicator ------------------
 def compute_rsi(series, period=14):
     delta = series.diff()
