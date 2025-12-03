@@ -1,24 +1,116 @@
 import streamlit as st
-from utils.tv_optionchain import get_tv_option_chain, parse_option_chain
+import pandas as pd
+import numpy as np
+import requests
+from datetime import datetime
+import plotly.graph_objects as go
 
-st.title("Live Option Chain (TradingView Source)")
+st.set_page_config(page_title="Option Chain (NSE API)", layout="wide")
 
-symbol = st.selectbox("Select Index", ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"])
+# ------------------------ Fetch NSE Option Chain ------------------------
+@st.cache_data(ttl=10)
+def fetch_nse_chain(symbol="NIFTY"):
+    url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    
+    s = requests.Session()
+    s.get("https://www.nseindia.com", headers=headers)
+    r = s.get(url, headers=headers)
+    return r.json()
 
-tv_data, err = get_tv_option_chain(symbol)
+# ------------------------ Parse Data ------------------------
+def parse_chain(data):
+    """Extracts nearest expiry CE/PE and returns DataFrame."""
+    records = data.get("records", {})
+    exp_list = records.get("expiryDates", [])
+    if not exp_list:
+        return pd.DataFrame()
 
-if err:
-    st.error("Data temporarily unavailable. Try again.")
+    nearest_expiry = exp_list[0]  # Auto-select nearest expiry
+    
+    rows = []
+    for item in records.get("data", []):
+        if item.get("expiryDate") != nearest_expiry:
+            continue
+        
+        strike = item.get("strikePrice")
+        ce = item.get("CE", {})
+        pe = item.get("PE", {})
+
+        rows.append({
+            "Strike": strike,
+            "CE_LTP": ce.get("lastPrice", 0),
+            "PE_LTP": pe.get("lastPrice", 0),
+            "CE_OI": ce.get("openInterest", 0),
+            "PE_OI": pe.get("openInterest", 0),
+            "CE_CHG_OI": ce.get("changeinOpenInterest", 0),
+            "PE_CHG_OI": pe.get("changeinOpenInterest", 0)
+        })
+
+    df = pd.DataFrame(rows)
+    return df.dropna().sort_values("Strike").reset_index(drop=True), nearest_expiry
+
+# ------------------------ UI ------------------------
+index = st.selectbox("Select Index", ["NIFTY", "BANKNIFTY", "FINNIFTY"], index=0)
+st.title(f"Option Chain — {index}")
+
+raw = fetch_nse_chain(index)
+df, expiry = parse_chain(raw)
+
+if df.empty:
+    st.error("No data received from NSE. Try again.")
     st.stop()
 
-calls, puts = parse_option_chain(tv_data)
+st.write(f"### Nearest Expiry: **{expiry}**")
 
-col1, col2 = st.columns(2)
+# ------------------------ ATM logic ------------------------
+atm_row = df.iloc[(df["CE_LTP"] + df["PE_LTP"]).abs().idxmin()]
+atm = atm_row["Strike"]
 
-with col1:
-    st.subheader("CALLS (CE)")
-    st.dataframe(calls)
+step = int(df["Strike"].diff().median())
+left = atm - 5 * step
+right = atm + 5 * step
 
-with col2:
-    st.subheader("PUTS (PE)")
-    st.dataframe(puts)
+df_f = df[(df["Strike"] >= left) & (df["Strike"] <= right)].copy()
+
+# ------------------------ Display Option Table ------------------------
+st.subheader("Nearest 10 Strikes (5 CE + 5 PE around ATM)")
+st.dataframe(df_f, use_container_width=True)
+
+# ------------------------ OI Change Chart ------------------------
+def plot_oi_change(df):
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=df['Strike'], y=df['CE_CHG_OI'], name='CE OI Change'))
+    fig.add_trace(go.Bar(x=df['Strike'], y=df['PE_CHG_OI'], name='PE OI Change'))
+    fig.update_layout(
+        barmode='group',
+        title="Open Interest Change for the Day",
+        xaxis_title="Strike Price",
+        yaxis_title="OI Change",
+        height=350
+    )
+    return fig
+
+st.subheader("CE & PE OI Change (Today)")
+st.plotly_chart(plot_oi_change(df_f), use_container_width=True)
+
+# ------------------------ OI Bar Graph ------------------------
+def plot_oi(df):
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=df["Strike"], y=df["CE_OI"], name="CE OI"))
+    fig.add_trace(go.Bar(x=df["Strike"], y=df["PE_OI"], name="PE OI"))
+    fig.update_layout(
+        barmode="group",
+        title="Open Interest (CE / PE)",
+        height=350
+    )
+    return fig
+
+st.subheader("Open Interest (CE & PE)")
+st.plotly_chart(plot_oi(df_f), use_container_width=True)
+
+# ------------------------ Download CSV ------------------------
+csv = df_f.to_csv(index=False)
+st.download_button("Download CSV", data=csv, file_name=f"{index}_{expiry}.csv")
+
+st.caption(f"Data Source: NSE | Last Updated: {datetime.now().strftime('%H:%M:%S')}")
