@@ -1,324 +1,442 @@
-# pages/option_chain_no_playwright.py
 """
-Streamlit Option Chain (no Playwright).
+Streamlit app: NIFTY intraday (09:15->11:30) trend strength
+- Uses Yahoo Finance ^NSEI (5m interval, 60d range) — reliable & free
+- Caches per-date CSVs under .yahoo_cache (fetch once per day or on demand)
+- Computes trend strength using user's original logic
 
-Shows nearest expiry, configurable strikes around ATM (default 5 each side),
-OI-change chart, PCR & PCR-change, RSI (synthetic from option prices),
-and a momentum suggestion that uses RSI + OI change.
+Usage: `streamlit run streamlit_app_yahoo.py`
 
-Auto-refreshes every 15 seconds (prefers streamlit-autorefresh, falls back to meta-refresh).
+Notes:
+- Fetching 60d at 5m interval returns ~60 * (6.5*12) ~ a few thousand rows; Yahoo is stable.
+- The app will fetch when you click "Force refresh cache" or when today's file missing.
 """
 
 import streamlit as st
 import pandas as pd
-import numpy as np
 import requests
+import datetime
 import time
-from datetime import datetime
-import plotly.graph_objects as go
+import pytz
+import matplotlib.pyplot as plt
+import numpy as np
+import os
 
-st.set_page_config(page_title="Option Chain (NSE API)", layout="wide")
+st.set_page_config(layout="wide", page_title="NIFTY — Intraday (Yahoo 5m) Trend Strength")
 
-# ---------- Auto-refresh (preferred) ----------
-META_REFRESH_SECS = 15
-USE_AUTREFRESH = False
-try:
-    # pip install streamlit-autorefresh
-    from streamlit_autorefresh import st_autorefresh
-    refresh_counter = st_autorefresh(interval=META_REFRESH_SECS * 1000, limit=None, key="auto_refresh_counter")
-    USE_AUTREFRESH = True
-except Exception:
-    # fallback to meta-refresh HTML (works in many setups)
-    st.markdown(f'<meta http-equiv="refresh" content="{META_REFRESH_SECS}">', unsafe_allow_html=True)
+# ---------------------------
+# Config
+# ---------------------------
+CACHE_DIR = ".yahoo_cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
+SYMBOL = "^NSEI"
+INTERVAL = "5m"  # chosen per user's A option
+RANGE = "60d"
+IST = pytz.timezone("Asia/Kolkata")
 
-# ------------------ Utilities ------------------
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.nseindia.com"
-}
+# ---------------------------
+# Yahoo fetch helpers
+# ---------------------------
 
-def safe_session_get(session: requests.Session, url: str, headers=None, timeout=8, retries=3):
-    headers = headers or HEADERS
-    for i in range(retries):
-        try:
-            r = session.get(url, headers=headers, timeout=timeout)
-            if r.status_code == 200:
-                return r
-            # small pause for transient status
-        except Exception:
-            time.sleep(0.6)
-    raise RuntimeError(f"Failed to GET {url} after {retries} attempts")
-
-# ------------------ Fetch NSE Chain ------------------
-@st.cache_data(ttl=12, show_spinner=False)  # short TTL so auto-refresh triggers fresh fetch
-def fetch_nse_chain(symbol: str = "NIFTY"):
+def fetch_intraday_yahoo(interval="5m", range_days="60d", symbol=SYMBOL, timeout=15):
     """
-    Fetch JSON option-chain from NSE for an index symbol.
-    Returns parsed JSON dict or raises.
+    Fetch intraday series from Yahoo Finance chart API.
+    Returns DataFrame with columns: datetime (tz-aware IST), price, volume
     """
-    base = "https://www.nseindia.com"
-    url = f"{base}/api/option-chain-indices?symbol={symbol}"
-    s = requests.Session()
-    # initial GET to obtain cookies / session headers (NSE often needs this)
-    try:
-        s.get(base, headers=HEADERS, timeout=5)
-    except Exception:
-        pass
-    r = safe_session_get(s, url, headers=HEADERS, timeout=10, retries=4)
-    return r.json()
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval={interval}&range={range_days}"
+    r = requests.get(url, timeout=timeout)
+    r.raise_for_status()
+    j = r.json()
+    # navigate to result
+    result = j.get("chart", {}).get("result")
+    if not result:
+        raise ValueError("No result in Yahoo response")
+    res0 = result[0]
+    timestamps = res0.get("timestamp")
+    if timestamps is None:
+        # Possibly an extended result under indicators -> adjclose only (rare)
+        raise ValueError("No timestamps in Yahoo response")
 
-def parse_chain(json_data):
-    """
-    Parse NSE JSON into a DataFrame with required fields (nearest expiry only).
-    """
-    rows = []
-    records = json_data.get("records", {}) if json_data else {}
-    data_list = records.get("data", []) if records else []
-    expiry_dates = records.get("expiryDates", []) if records else []
-    nearest_expiry = expiry_dates[0] if expiry_dates else None
+    indicators = res0.get("indicators", {}).get("quote", [])[0]
+    closes = indicators.get("close")
+    volumes = indicators.get("volume")
 
-    for item in data_list:
-        # filter for nearest expiry only
-        if nearest_expiry and item.get("expiryDate") != nearest_expiry:
-            continue
-
-        strike = item.get("strikePrice")
-        ce = item.get("CE", {}) or {}
-        pe = item.get("PE", {}) or {}
-
-        rows.append({
-            "Strike": strike,
-            "CE_LTP": ce.get("lastPrice", 0.0),
-            "PE_LTP": pe.get("lastPrice", 0.0),
-            "CE_OI": ce.get("openInterest", 0),
-            "PE_OI": pe.get("openInterest", 0),
-            "CE_CHG_OI": ce.get("changeinOpenInterest", 0),
-            "PE_CHG_OI": pe.get("changeinOpenInterest", 0),
-            "expiryDate": item.get("expiryDate")
-        })
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-    # coerce types
-    df["Strike"] = pd.to_numeric(df["Strike"], errors="coerce")
-    for col in ["CE_LTP", "PE_LTP"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-    for col in ["CE_OI", "PE_OI", "CE_CHG_OI", "PE_CHG_OI"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
-    df = df.dropna(subset=["Strike"]).sort_values("Strike").reset_index(drop=True)
+    df = pd.DataFrame({
+        "datetime": pd.to_datetime(timestamps, unit="s", utc=True).tz_convert("Asia/Kolkata"),
+        "price": closes,
+        "volume": volumes
+    })
+    # drop rows where price is None (market closed periods)
+    df = df.dropna(subset=["price"]).reset_index(drop=True)
     return df
 
-# ------------------ RSI ------------------
-def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+
+def split_and_cache_by_date(df, cache_dir=CACHE_DIR):
     """
-    Compute RSI using Wilder smoothing (EMA-like). Returns series aligned with input.
+    Split DataFrame into per-date CSVs (date in IST) and save into cache.
+    Overwrites existing files for the dates present in df.
+    Returns list of dates saved.
     """
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = (-delta).clip(lower=0)
-    avg_gain = gain.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
-    avg_loss = loss.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
-    rs = avg_gain / (avg_loss + 1e-12)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
+    df = df.copy()
+    df["date"] = df["datetime"].dt.tz_convert("Asia/Kolkata").dt.date
+    saved = []
+    for d, grp in df.groupby("date"):
+        path = os.path.join(cache_dir, f"nifty_{d.isoformat()}.csv")
+        # ensure datetime stored in ISO format with timezone info
+        out = grp.drop(columns=["date"]).copy()
+        out.to_csv(path, index=False)
+        saved.append(d)
+    return saved
 
-# ------------------ UI / Controls ------------------
-st.title("📊 Option Chain — NSE (No Playwright)")
-st.caption(f"Nearest expiry, ±N strikes around ATM. Auto-refresh every {META_REFRESH_SECS}s")
 
-with st.sidebar:
-    st.markdown("## Controls")
-    index_choice = st.selectbox("Index", ["NIFTY", "BANKNIFTY", "FINNIFTY"], index=0)
-    strikes_each_side = st.slider("Strikes each side of ATM", 3, 12, 5)
-    # manual refresh: clear cached fetch and force rerun
-    if st.button("Force refresh (clear fetch cache)", key="btn_force_refresh"):
-        fetch_nse_chain.clear()
-        # if st_autorefresh is available it will trigger next tick automatically
+# ---------------------------
+# Cache helpers
+# ---------------------------
 
-# ------------------ Fetch + parse ------------------
-loading_text = st.empty()
-loading_text.info("Fetching option-chain from NSE (nearest expiry)...", icon="🔁")
-try:
-    raw = fetch_nse_chain(index_choice)
-    loading_text.empty()
-except Exception as e:
-    loading_text.error(f"Failed to fetch data from NSE: {e}")
-    st.stop()
+def cache_path_for_date(date_obj, cache_dir=CACHE_DIR):
+    return os.path.join(cache_dir, f"nifty_{date_obj.isoformat()}.csv")
 
-df_all = parse_chain(raw)
-if df_all.empty:
-    st.error("No option chain data parsed. NSE structure may have changed or request blocked.")
-    st.stop()
 
-# show which expiry used
-expiry_dates = raw.get("records", {}).get("expiryDates", [])
-nearest_expiry = expiry_dates[0] if expiry_dates else None
-
-# get spot if available and show on top with unique key
-spot = raw.get("records", {}).get("underlyingValue")
-spot_val = None
-if spot is not None:
+def load_cached_date(date_obj, cache_dir=CACHE_DIR):
+    path = cache_path_for_date(date_obj, cache_dir)
+    if not os.path.exists(path):
+        return None
     try:
-        spot_val = float(spot)
+        df = pd.read_csv(path)
+        # ensure datetime parsed
+        if "datetime" in df.columns:
+            df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize(None)
+            # stored timezone info may be present; convert to tz-aware IST
+            try:
+                # attempt to parse any tz info
+                df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize("UTC").dt.tz_convert("Asia/Kolkata")
+            except Exception:
+                # if already tz-aware or naive, attach IST
+                df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize("Asia/Kolkata")
+        else:
+            # fallback: construct naive datetimes if first column looks like a timestamp
+            df["datetime"] = pd.to_datetime(df.iloc[:,0]).dt.tz_localize("Asia/Kolkata")
+        # ensure price and volume columns present
+        if "price" not in df.columns and "close" in df.columns:
+            df = df.rename(columns={"close":"price"})
+        if "volume" not in df.columns:
+            df["volume"] = np.nan
+        return df
     except Exception:
-        spot_val = None
+        return None
 
-if spot_val is not None:
-    st.metric(label=f"{index_choice} Spot", value=f"{spot_val:,.2f}", delta=None, key=f"metric_spot_{index_choice}")
-else:
-    st.markdown("**Spot price not available in payload**")
 
-st.markdown(f"**Expiry used:** {nearest_expiry if nearest_expiry else 'Not available'}")
+def ensure_cache_for_recent_days(days=60):
+    """
+    If multiple dates missing, fetch the 60d Yahoo dataset once and split into per-date cache files.
+    Returns set of dates available in cache after the operation.
+    """
+    # Determine which dates already cached
+    today = datetime.date.today()
+    dates = [today - datetime.timedelta(days=i) for i in range(days)]
+    missing = [d for d in dates if not os.path.exists(cache_path_for_date(d))]
+    if not missing:
+        return set(dates)
 
-# ------------------ Determine ATM ------------------
-if spot_val is not None:
-    strikes = df_all["Strike"].unique()
-    atm = int(min(strikes, key=lambda s: abs(s - spot_val)))
-else:
-    # synthetic: pick strike where CE_LTP+PE_LTP is minimal
-    df_all["mid_sum"] = df_all["CE_LTP"] + df_all["PE_LTP"]
-    idx = df_all["mid_sum"].idxmin() if not df_all["mid_sum"].isna().all() else None
-    if idx is not None:
-        atm = int(df_all.loc[idx, "Strike"])
+    # Fetch once and split
+    try:
+        df_all = fetch_intraday_yahoo(interval=INTERVAL, range_days=RANGE)
+    except Exception as e:
+        st.warning(f"Failed to fetch Yahoo intraday: {e}")
+        return set([d for d in dates if os.path.exists(cache_path_for_date(d))])
+
+    saved = split_and_cache_by_date(df_all)
+    return set(saved)
+
+
+# ---------------------------
+# Time helpers
+# ---------------------------
+
+def now_ist():
+    return datetime.datetime.now(IST)
+
+
+def seconds_until_next_target(hour_targets=(9,17)):
+    now = now_ist()
+    today = now.date()
+    candidates = []
+    for h in hour_targets:
+        target = IST.localize(datetime.datetime.combine(today, datetime.time(h,0)))
+        if target <= now:
+            target = target + datetime.timedelta(days=1)
+        candidates.append(target)
+    next_target = min(candidates)
+    return int((next_target - now).total_seconds())
+
+
+# ---------------------------
+# Trend strength computation (unchanged logic, slightly adapted)
+# ---------------------------
+
+def compute_ema(series, span):
+    return series.ewm(span=span, adjust=False).mean()
+
+
+def compute_vwap(df):
+    if "volume" in df.columns and not df["volume"].isna().all():
+        pv = (df["price"] * df["volume"]).fillna(0)
+        cum_pv = pv.cumsum()
+        cum_vol = df["volume"].fillna(0).cumsum()
+        mask = cum_vol > 0
+        vwap = pd.Series(np.nan, index=df.index)
+        vwap[mask] = (cum_pv[mask] / cum_vol[mask])
+        return vwap
     else:
-        atm = int(df_all["Strike"].iloc[len(df_all)//2])
+        return df["price"].expanding().mean()
 
-# compute step between strikes (median diff)
-step = int(round(df_all["Strike"].diff().median())) if len(df_all) > 1 else 50
-left_bound = atm - strikes_each_side * step
-right_bound = atm + strikes_each_side * step
 
-# window
-df_window = df_all[(df_all["Strike"] >= left_bound) & (df_all["Strike"] <= right_bound)].copy().reset_index(drop=True)
+def compute_trend_strength(df):
+    out = {"score": None, "class": None, "components": {}}
+    if df is None or df.empty:
+        return out
 
-# ensure the table and charts have unique keys to avoid duplicate element id errors
-table_key = f"table_{index_choice}_{int(time.time())}"
-oi_chart_key = f"oi_change_{index_choice}_{int(time.time())}"
-pcr_chart_key = f"pcr_line_{index_choice}_{int(time.time())}"
-rsi_price_key = f"rsi_price_{index_choice}_{int(time.time())}"
-rsi_chart_key = f"rsi_chart_{index_choice}_{int(time.time())}"
+    working = df.copy().reset_index(drop=True)
+    working["price"] = pd.to_numeric(working["price"], errors="coerce")
+    working = working.dropna(subset=["price"])
+    if working.empty:
+        return out
 
-# show table and highlight ATM
-st.subheader(f"Nearby Option Strikes around ATM {atm} (±{strikes_each_side} strikes)")
+    ema_short = compute_ema(working["price"], span=9)
+    ema_long = compute_ema(working["price"], span=26)
+    last_price = float(working["price"].iloc[-1])
+    first_price = float(working["price"].iloc[0])
+    price_range = max(1e-6, working["price"].max() - working["price"].min())
 
-def highlight_atm(row):
-    return ['background-color: #1f2a30; color: #ffd700' if row['Strike'] == atm else '' for _ in row]
+    ema9_slope = (ema_short.iloc[-1] - ema_short.iloc[0]) / price_range
+    ema26_slope = (ema_long.iloc[-1] - ema_long.iloc[0]) / price_range
 
-styled = (df_window.style
-          .apply(highlight_atm, axis=1)
-          .format({
-              "Strike": "{:,.0f}",
-              "CE_OI": "{:,}",
-              "PE_OI": "{:,}",
-              "CE_LTP": "{:,.2f}",
-              "PE_LTP": "{:,.2f}",
-              "CE_CHG_OI": "{:,}",
-              "PE_CHG_OI": "{:,}"
-          }))
-st.dataframe(styled, use_container_width=True, key=table_key)
+    vwap_series = compute_vwap(working)
+    vwap_last = float(vwap_series.iloc[-1]) if not vwap_series.isna().all() else np.nan
+    if not np.isnan(vwap_last) and vwap_last != 0:
+        vwap_gap_pct = (last_price - vwap_last) / vwap_last
+    else:
+        vwap_gap_pct = (last_price - first_price) / max(1e-6, first_price)
 
-# ------------------ OI Change Chart ------------------
-st.subheader("CE & PE ΔOI — Today (Nearby strikes)")
+    momentum_pct = (last_price - first_price) / max(1e-6, first_price)
 
-def plot_oi_change(df):
-    fig = go.Figure()
-    fig.add_trace(go.Bar(x=df["Strike"], y=df["CE_CHG_OI"], name="CE ΔOI"))
-    fig.add_trace(go.Bar(x=df["Strike"], y=df["PE_CHG_OI"], name="PE ΔOI"))
-    fig.update_layout(barmode="group", template="plotly_dark", height=360,
-                      xaxis_title="Strike", yaxis_title="Change in OI")
-    return fig
+    diffs = np.abs(working["price"].diff().fillna(0))
+    avg_move = float(diffs.mean())
+    vol_norm = avg_move / max(1e-6, price_range)
 
-st.plotly_chart(plot_oi_change(df_window), use_container_width=True, key=oi_chart_key)
+    if "volume" in working.columns and not working["volume"].isna().all():
+        avg_vol = float(working["volume"].mean())
+        med_vol = float(np.nanmedian(working["volume"].values))
+        vol_conf = (avg_vol / (med_vol + 1e-6)) if med_vol > 0 else 1.0
+        vol_conf = min(vol_conf, 5.0)
+    else:
+        vol_conf = 1.0
 
-# ------------------ PCR (window) & PCR line ------------------
-st.subheader("PCR (PE_OI / CE_OI) — Window")
-pcr_total_ce = df_window["CE_OI"].sum()
-pcr_total_pe = df_window["PE_OI"].sum()
-pcr = (pcr_total_pe / pcr_total_ce) if pcr_total_ce else 0
-pcr_change = (df_window["PE_CHG_OI"].sum() - df_window["CE_CHG_OI"].sum()) / max(pcr_total_ce, 1)
+    def slope_to_score(s):
+        return 1.0 / (1.0 + np.exp(-4 * s))
 
-st.markdown(f"- **PCR (window):** {pcr:.3f}")
-st.markdown(f"- **PCR change (today, window):** {pcr_change:.3f}")
+    ema_short_score = slope_to_score(ema9_slope)
+    ema_long_score = slope_to_score(ema26_slope)
+    ema_score = 0.65 * ema_short_score + 0.35 * ema_long_score
 
-# PCR strike-wise line
-pcr_line = df_window["PE_OI"] / df_window["CE_OI"].replace(0, np.nan)
-fig_pcr = go.Figure()
-fig_pcr.add_trace(go.Scatter(x=df_window["Strike"], y=pcr_line, mode="lines+markers", name="PCR"))
-fig_pcr.update_layout(template="plotly_dark", height=300, yaxis_title="PCR", xaxis_title="Strike")
-st.plotly_chart(fig_pcr, use_container_width=True, key=pcr_chart_key)
+    vwap_score = 0.5 + 0.5 * np.tanh(6 * vwap_gap_pct)
+    momentum_score = 0.5 + 0.5 * np.tanh(4 * momentum_pct)
 
-# ------------------ RSI (synthetic) ------------------
-st.subheader("RSI (synthetic) — derived from option prices")
+    if vol_conf >= 1.0:
+        vol_score = 1.0 - 1.0/(1.0 + (vol_conf-1.0))
+    else:
+        vol_score = vol_conf/2.0 + 0.25
+    vol_score = float(np.clip(vol_score, 0.0, 1.0))
 
-# Synthetic price example: midpoint of CE_LTP & PE_LTP
-df_window["SYM_PRICE"] = (df_window["CE_LTP"] + df_window["PE_LTP"]) / 2.0
-rsi_series = compute_rsi(df_window["SYM_PRICE"], period=14)
-df_window["RSI"] = rsi_series
+    vol_penalty = float(np.clip(np.tanh(6 * vol_norm), 0.0, 1.0))
 
-fig_price = go.Figure()
-fig_price.add_trace(go.Scatter(x=df_window["Strike"], y=df_window["SYM_PRICE"], mode="lines+markers", name="Synthetic Price"))
-fig_price.update_layout(template="plotly_dark", height=300, yaxis_title="Synthetic Price", xaxis_title="Strike")
+    w = {"ema": 0.38, "vwap": 0.28, "momentum": 0.20, "volume": 0.14}
+    base_score = (w["ema"] * ema_score + w["vwap"] * vwap_score + w["momentum"] * momentum_score + w["volume"] * vol_score)
+    score = base_score * (1.0 - 0.6 * vol_penalty)
+    score_0_100 = float(np.clip(score * 100.0, 0.0, 100.0))
 
-fig_rsi = go.Figure()
-fig_rsi.add_trace(go.Scatter(x=df_window["Strike"], y=df_window["RSI"], mode="lines+markers", name="RSI"))
-fig_rsi.update_layout(template="plotly_dark", height=260, yaxis_title="RSI", yaxis=dict(range=[0,100]), xaxis_title="Strike")
+    if score_0_100 >= 75:
+        cl = "Strong Bullish"
+    elif score_0_100 >= 60:
+        cl = "Mild Bullish"
+    elif score_0_100 >= 45:
+        cl = "Neutral"
+    elif score_0_100 >= 30:
+        cl = "Mild Bearish"
+    else:
+        cl = "Strong Bearish"
 
-col1, col2 = st.columns([2, 1])
-with col1:
-    st.plotly_chart(fig_price, use_container_width=True, key=rsi_price_key)
-with col2:
-    st.plotly_chart(fig_rsi, use_container_width=True, key=rsi_chart_key)
+    out["score"] = round(score_0_100, 1)
+    out["class"] = cl
+    out["components"] = {
+        "ema9_slope": float(ema9_slope),
+        "ema26_slope": float(ema26_slope),
+        "ema_short_score": float(round(ema_short_score, 3)),
+        "ema_long_score": float(round(ema_long_score, 3)),
+        "vwap_gap_pct": float(round(vwap_gap_pct, 5)),
+        "vwap_score": float(round(vwap_score, 3)),
+        "momentum_pct": float(round(momentum_pct, 5)),
+        "momentum_score": float(round(momentum_score, 3)),
+        "vol_conf": float(round(vol_conf, 3)),
+        "vol_score": float(round(vol_score, 3)),
+        "vol_norm": float(round(vol_norm, 6)),
+        "volatility_penalty": float(round(vol_penalty, 3))
+    }
+    return out
 
-# ------------------ Momentum suggestion ------------------
-st.subheader("Momentum suggestion (RSI + OI-change)")
 
-latest_rsi_val = float(df_window["RSI"].dropna().iloc[-1]) if not df_window["RSI"].dropna().empty else None
-total_ce_chg = int(df_window["CE_CHG_OI"].sum())
-total_pe_chg = int(df_window["PE_CHG_OI"].sum())
+# ---------------------------
+# UI
+# ---------------------------
 
-# RSI bias
-rsi_bias = 0
-if latest_rsi_val is not None:
-    if latest_rsi_val > 70:
-        rsi_bias = -1
-    elif latest_rsi_val < 30:
-        rsi_bias = 1
-    elif latest_rsi_val > 55:
-        rsi_bias = -0.5
-    elif latest_rsi_val < 45:
-        rsi_bias = 0.5
+st.title("📈 NIFTY — Intraday to 11:30 + Trend Strength (Yahoo 5m, cached)")
 
-# OI bias: CE accumulation => bullish
-oi_bias = 0
-if (total_ce_chg - total_pe_chg) > max(200, 0.05 * (abs(total_ce_chg) + abs(total_pe_chg) + 1)):
-    oi_bias = 1
-elif (total_pe_chg - total_ce_chg) > max(200, 0.05 * (abs(total_ce_chg) + abs(total_pe_chg) + 1)):
-    oi_bias = -1
+cols_ui = st.columns([1, 3])
+with cols_ui[0]:
+    n_days = st.number_input("Days to show", min_value=5, max_value=60, value=30, step=5)
+    show_next = st.checkbox("Show next scheduled refresh time", value=True)
+    force_refresh = st.button("Force refresh cache (fetch 60d from Yahoo)")
+with cols_ui[1]:
+    st.write("Notes: Using Yahoo Finance ^NSEI with 5-minute resolution (60 days). Cached per-date in `.yahoo_cache`.")
 
-combined_score = rsi_bias + oi_bias
-if combined_score >= 1.5:
-    suggestion = "📈 Strong Bullish"
-elif combined_score >= 0.5:
-    suggestion = "🔼 Mild Bullish"
-elif combined_score <= -1.5:
-    suggestion = "📉 Strong Bearish"
-elif combined_score <= -0.5:
-    suggestion = "🔽 Mild Bearish"
-else:
-    suggestion = "⚖ Neutral / Sideways"
+if show_next:
+    sec = seconds_until_next_target((9,17))
+    next_time = now_ist() + datetime.timedelta(seconds=sec)
+    st.write(f"Next scheduled refresh (approx): {next_time.strftime('%Y-%m-%d %H:%M:%S %Z')} (in {sec} seconds)")
 
-st.markdown(f"- **Latest RSI (synthetic):** {latest_rsi_val:.2f}" if latest_rsi_val is not None else "- **Latest RSI (synthetic):** N/A")
-st.markdown(f"- **Total CE ΔOI (window):** {total_ce_chg:,}")
-st.markdown(f"- **Total PE ΔOI (window):** {total_pe_chg:,}")
-st.success(f"Momentum suggestion: **{suggestion}**")
+# If user forces refresh, fetch full 60d and split
+if force_refresh:
+    with st.spinner("Fetching 60 days of 5-minute data from Yahoo and caching per date..."):
+        try:
+            df_all = fetch_intraday_yahoo(interval=INTERVAL, range_days=RANGE)
+            saved_dates = split_and_cache_by_date(df_all)
+            st.success(f"Cached data for {len(saved_dates)} dates (most recent: {max(saved_dates) if saved_dates else 'none'}).")
+        except Exception as e:
+            st.error(f"Failed to refresh cache: {e}")
 
-# ------------------ CSV Download & Footer ------------------
-st.markdown("---")
-download_df = df_window.copy()
-download_df["fetched_at_utc"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-csv = download_df.to_csv(index=False)
-st.download_button("Download displayed CSV", csv, file_name=f"{index_choice}_option_chain_{int(time.time())}.csv", mime="text/csv", key=f"download_{index_choice}")
+# Ensure cache exists for recent window (try background fill but avoid aggressive network ops)
+with st.spinner("Ensuring recent dates cached (will fetch from Yahoo if needed)..."):
+    available_dates = ensure_cache_for_recent_days(days=60)
 
-st.caption(f"Data source: NSE (nearest expiry). Last fetch: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC. Auto-refresh: {META_REFRESH_SECS}s.")
+# Prepare list of dates to display
+dates = [datetime.date.today() - datetime.timedelta(days=i) for i in range(n_days)]
+dates = sorted(dates)
+
+# Load cached data for each requested date
+days_data = []
+for d in dates:
+    df = load_cached_date(d)
+    days_data.append((d, df))
+
+# utility to clip to 09:15-11:30 IST
+
+def clip_to_session_df(df):
+    if df is None or df.empty:
+        return df
+    ser = pd.to_datetime(df["datetime"]).dt.tz_convert("Asia/Kolkata")
+    mask = ser.dt.time >= datetime.time(9,15)
+    mask &= ser.dt.time <= datetime.time(11,30)
+    return df.loc[mask].reset_index(drop=True)
+
+# layout grid
+cols_per_row = 5
+rows = (len(days_data) + cols_per_row - 1) // cols_per_row
+
+st.header("Mini-charts + Trend strength (09:15 → 11:30)")
+
+for r in range(rows):
+    cols = st.columns(cols_per_row)
+    for c in range(cols_per_row):
+        idx = r*cols_per_row + c
+        if idx >= len(days_data):
+            continue
+        d, df = days_data[idx]
+        with cols[c]:
+            st.subheader(d.strftime("%Y-%m-%d"))
+            if df is None or df.empty:
+                st.info("No intraday data (not cached). Try 'Force refresh cache' to fetch 60d from Yahoo.")
+                continue
+            clipped = clip_to_session_df(df)
+            if clipped is None or clipped.empty:
+                st.info("No data in 09:15–11:30 window")
+                continue
+
+            ts = compute_trend_strength(clipped)
+
+            cls = ts.get("class", "Unknown")
+            score = ts.get("score", None)
+            if cls == "Strong Bullish":
+                color_box = "#1f8b4c"
+            elif cls == "Mild Bullish":
+                color_box = "#65c466"
+            elif cls == "Neutral":
+                color_box = "#bfbf00"
+            elif cls == "Mild Bearish":
+                color_box = "#ff8a5b"
+            elif cls == "Strong Bearish":
+                color_box = "#d9534f"
+            else:
+                color_box = "#999999"
+
+            cols_badge = st.columns([2, 5])
+            with cols_badge[0]:
+                st.markdown(
+                    f"<div style='background:{color_box};color:white;padding:8px;border-radius:6px;text-align:center'>"
+                    f"<strong style='font-size:18px'>{score if score is not None else 'NA'}</strong><br><small>Trend</small></div>",
+                    unsafe_allow_html=True
+                )
+            with cols_badge[1]:
+                st.markdown(f"**{cls}**")
+                comps = ts.get("components", {})
+                if comps:
+                    st.caption(
+                        f"EMA9_slope={comps.get('ema9_slope'):.4f}  "
+                        f"VWAP_gap={comps.get('vwap_gap_pct'):.4f}  "
+                        f"Momentum={comps.get('momentum_pct'):.4f}"
+                    )
+
+            fig, (ax0, ax1) = plt.subplots(2,1, figsize=(4,2.6), gridspec_kw={'height_ratios':[2,0.8]})
+            times = pd.to_datetime(clipped["datetime"]).dt.tz_convert("Asia/Kolkata")
+            xlabels = times.dt.strftime("%H:%M")
+            ax0.plot(xlabels, clipped["price"], linewidth=1.0)
+            try:
+                v = compute_vwap(clipped)
+                ax0.plot(xlabels, v, linewidth=0.9, linestyle="--", alpha=0.8)
+            except Exception:
+                pass
+            ax0.set_xticks([xlabels.iloc[0], xlabels.iloc[len(xlabels)//2], xlabels.iloc[-1]])
+            ax0.tick_params(axis='x', rotation=45, labelsize=7)
+            ax0.set_ylabel("Price", fontsize=8)
+
+            if "volume" in clipped.columns and not clipped["volume"].isna().all():
+                ax1.bar(xlabels, clipped["volume"].fillna(0), width=0.6)
+            ax1.set_xticks([xlabels.iloc[0], xlabels.iloc[len(xlabels)//2], xlabels.iloc[-1]])
+            ax1.tick_params(axis='x', rotation=45, labelsize=7)
+            ax1.set_ylabel("Vol", fontsize=8)
+
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
+
+st.write("---")
+st.header("How Trend Strength is computed (short)")
+st.markdown("""
+The score (0–100) is a weighted composite of:
+- **EMA slopes** (fast + slow): measures short & medium momentum.
+- **VWAP gap**: whether price is above/below value area (supports trend).
+- **Session momentum**: last vs first price in the 09:15–11:30 window.
+- **Volume confirmation**: whether volume supports the price move.
+- **Volatility penalty**: noisy, choppy moves reduce the score.
+
+**Interpretation**
+- 75–100: Strong Bullish — high confidence trend to the upside
+- 60–74: Mild Bullish
+- 45–59: Neutral
+- 30–44: Mild Bearish
+- 0–29: Strong Bearish
+
+Notes & caveats:
+- This is a heuristic composite for intraday trend *strength*, intended to help prioritise which days show clear directional bias early (till 11:30). It is **not** a trading signal by itself — combine with price action, risk management and confirmation.
+- Metric depends on data quality (volumes especially). If volume is missing for a day, volume-based component becomes neutral.
+""")
+
+st.success("Trend strength detection added. The app caches per-day intraday in `.yahoo_cache`.")
