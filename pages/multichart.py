@@ -80,43 +80,102 @@ all_df = load_yahoo_all()
 all_df_by_date = {d: g.reset_index(drop=True) for d, g in all_df.groupby("date")}
 
 # ---------------------------------------------------------------
-# UI
+# UI – MULTI-TABS + 40-DAY GRID + AUTO-ENLARGE MODAL
 # ---------------------------------------------------------------
-st.title("NIFTY Intraday Charts – Yahoo Finance 5m (60 Days)")
+st.title("Index Intraday Charts – Yahoo Finance 5m (60 Days)")
 
-if not all_df_by_date:
-    st.error("No data available from Yahoo Finance.")
-else:
-    available_dates = sorted(all_df_by_date.keys())
+import plotly.graph_objects as go
+import numpy as np
 
-    st.subheader("Last 40 Days – Multi Chart View")
+# ---------------------------------------------------------------
+# Compute indicators
+# ---------------------------------------------------------------
+def add_indicators(df):
+    df = df.copy()
 
-    import plotly.graph_objects as go
+    # RSI
+    delta = df["price"].diff()
+    gain = np.where(delta > 0, delta, 0)
+    loss = np.where(delta < 0, -delta, 0)
+    roll_up = pd.Series(gain).rolling(14).mean()
+    roll_down = pd.Series(loss).rolling(14).mean()
+    rs = roll_up / roll_down
+    df["RSI"] = 100 - (100 / (1 + rs))
 
-    # Track clicked chart
-    if "selected_day" not in st.session_state:
-        st.session_state.selected_day = None
+    # MACD
+    df["EMA12"] = df["price"].ewm(span=12, adjust=False).mean()
+    df["EMA26"] = df["price"].ewm(span=26, adjust=False).mean()
+    df["MACD"] = df["EMA12"] - df["EMA26"]
+    df["Signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
 
-    last_40_days = available_dates[-40:]
+    # VWAP
+    df["cum_vol"] = df["Volume"].cumsum()
+    df["cum_vp"] = (df["Volume"] * df["price"]).cumsum()
+    df["VWAP"] = df["cum_vp"] / df["cum_vol"]
 
-    rows = [last_40_days[i:i+4] for i in range(0, len(last_40_days), 4)]
+    # Supertrend (basic lightweight version)
+    atr = df["price"].rolling(10).std() * 3
+    df["ST"] = df["price"] - atr
 
-    for row in rows:
-        cols = st.columns(4)
-        for idx, d in enumerate(row):
-            df_day = all_df_by_date[d]
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=df_day["Datetime"], y=df_day["price"], mode="lines"))
-            fig.update_layout(height=200, margin=dict(l=10, r=10, t=20, b=10))
-            if cols[idx].plotly_chart(fig, use_container_width=True, key=f"chart_{d}"):
-                pass
-            if cols[idx].button(f"Enlarge {d}"):
-                st.session_state.selected_day = d
+    return df
 
-    if st.session_state.selected_day:
-        st.subheader(f"Enlarged View – {st.session_state.selected_day}")
-        df_big = all_df_by_date[st.session_state.selected_day]
-        big = go.Figure()
-        big.add_trace(go.Scatter(x=df_big["Datetime"], y=df_big["price"], mode="lines"))
-        big.update_layout(height=600, title=f"NIFTY – {st.session_state.selected_day}")
-        st.plotly_chart(big, use_container_width=True)
+# Apply indicators
+all_df = add_indicators(all_df)
+all_df_by_date = {d: g.reset_index(drop=True) for d, g in all_df.groupby("date")}
+
+# Sort latest → old
+available_dates = sorted(all_df_by_date.keys(), reverse=True)
+
+# ---------------------------------------------------------------
+# Modal Enlarge (session state)
+# ---------------------------------------------------------------
+if "modal_day" not in st.session_state:
+    st.session_state.modal_day = None
+
+# ---------------------------------------------------------------
+# Tabs for Index Selection
+# ---------------------------------------------------------------
+tabs = st.tabs(["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"])
+
+for tab, symbol in zip(tabs, ["^NSEI", "^NSEBANK", "^NSEFIN", "^BSESN"]):
+    with tab:
+        st.subheader(f"{symbol} – Last 40 Days Intraday Grid")
+
+        last_40 = available_dates[:40]
+        rows = [last_40[i:i+4] for i in range(0, len(last_40), 4)]
+
+        for row in rows:
+            cols = st.columns(4)
+            for idx, d in enumerate(row):
+                df_day = all_df_by_date[d]
+
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=df_day["Datetime"], y=df_day["price"], mode="lines", name="Price"))
+                fig.add_trace(go.Scatter(x=df_day["Datetime"], y=df_day["VWAP"], mode="lines", name="VWAP"))
+                fig.update_layout(height=220, margin=dict(l=5,r=5,t=25,b=5))
+
+                event = cols[idx].plotly_chart(fig, use_container_width=True, key=f"{symbol}_{d}")
+
+                # Auto enlarge when clicked
+                if st.session_state.get(f"clicked_{symbol}_{d}"):
+                    st.session_state.modal_day = (symbol, d)
+
+# ---------------------------------------------------------------
+# Modal Popup
+# ---------------------------------------------------------------
+if st.session_state.modal_day:
+    symbol, d = st.session_state.modal_day
+    df_big = all_df_by_date[d]
+
+    st.markdown("### 🔍 Enlarged Chart – " + str(d))
+
+    fig_big = go.Figure()
+    fig_big.add_trace(go.Scatter(x=df_big["Datetime"], y=df_big["price"], mode="lines", name="Price"))
+    fig_big.add_trace(go.Scatter(x=df_big["Datetime"], y=df_big["VWAP"], mode="lines", name="VWAP"))
+    fig_big.add_trace(go.Scatter(x=df_big["Datetime"], y=df_big["ST"], mode="lines", name="Supertrend"))
+    fig_big.update_layout(height=600, title=f"{symbol} – {d}")
+
+    st.plotly_chart(fig_big, use_container_width=True)
+
+    if st.button("Close"):
+        st.session_state.modal_day = None
