@@ -89,36 +89,34 @@ if not all_df_by_date:
 else:
     available_dates = sorted(all_df_by_date.keys())
 
-    selected_date = st.date_input(
-        "Select Date",
-        value=available_dates[-1],
-        min_value=available_dates[0],
-        max_value=available_dates[-1],
-    )
+    st.subheader("Last 40 Days – Multi Chart View")
 
-    # ---------------------------------------------------------------
-    # Get Data for Selected Date
-    # ---------------------------------------------------------------
-    day_df = all_df_by_date.get(selected_date, None)
+    import plotly.graph_objects as go
 
-    # ---------------------------------------------------------------
-    # Show Trend Strength
-    # ---------------------------------------------------------------
-    score, label = calculate_trend_strength(day_df)
+    # Track clicked chart
+    if "selected_day" not in st.session_state:
+        st.session_state.selected_day = None
 
-    col1, col2 = st.columns(2)
-    col1.metric("Trend Score", score if score else "-")
-    col2.metric("Trend Label", label)
+    last_40_days = available_dates[-40:]
 
-    # ---------------------------------------------------------------
-    # Plot
-    # ---------------------------------------------------------------
-    if day_df is not None and len(day_df) > 0:
-        fig, ax = plt.subplots(figsize=(12, 5))
-        ax.plot(day_df["Datetime"], day_df["price"])
-        ax.set_title(f"NIFTY Price on {selected_date}")
-        ax.set_xlabel("Time (IST)")
-        ax.set_ylabel("Price")
-        st.pyplot(fig)
-    else:
-        st.warning("No intraday data available.")
+    rows = [last_40_days[i:i+4] for i in range(0, len(last_40_days), 4)]
+
+    for row in rows:
+        cols = st.columns(4)
+        for idx, d in enumerate(row):
+            df_day = all_df_by_date[d]
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=df_day["Datetime"], y=df_day["price"], mode="lines"))
+            fig.update_layout(height=200, margin=dict(l=10, r=10, t=20, b=10))
+            if cols[idx].plotly_chart(fig, use_container_width=True, key=f"chart_{d}"):
+                pass
+            if cols[idx].button(f"Enlarge {d}"):
+                st.session_state.selected_day = d
+
+    if st.session_state.selected_day:
+        st.subheader(f"Enlarged View – {st.session_state.selected_day}")
+        df_big = all_df_by_date[st.session_state.selected_day]
+        big = go.Figure()
+        big.add_trace(go.Scatter(x=df_big["Datetime"], y=df_big["price"], mode="lines"))
+        big.update_layout(height=600, title=f"NIFTY – {st.session_state.selected_day}")
+        st.plotly_chart(big, use_container_width=True)
